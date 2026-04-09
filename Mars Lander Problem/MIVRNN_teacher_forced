@@ -1,0 +1,360 @@
+#This script implements the MI informed CVAE with RNN structure
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset
+from pathlib import Path
+import pandas as pd
+import glob, os
+import matplotlib.pyplot as plt
+
+# ---------------------------
+# Device and seed
+# ---------------------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.manual_seed(32)
+
+# ---------------------------
+# ---------------------------
+
+def load_and_stack_csv(folder_path, file_pattern):
+    csv_files = sorted(glob.glob(os.path.join(folder_path, file_pattern)))
+    if len(csv_files) == 0:
+        raise FileNotFoundError(f"No files found matching '{file_pattern}'")
+    tensor_list = []
+    for file in csv_files:
+        df = pd.read_csv(file, header=0).astype(float)
+        df = df.iloc[:, 1:]
+        tensor_list.append(torch.tensor(df.values, dtype=torch.float32).T)
+    return torch.stack(tensor_list)   # [N, 12, T]
+
+A_path = "C:/Users/nubapat/OneDrive - Worcester Polytechnic Institute (wpi.edu)/Documents/Desktop/Journal_2025_work/data_process_real_noise"
+B_path = "C:/Users/nubapat/OneDrive - Worcester Polytechnic Institute (wpi.edu)/Documents/Desktop/Journal_2025_work/data_process_sim_noise"
+
+A_raw = load_and_stack_csv(A_path, "*_*_process_noise_real.csv")
+B_raw = load_and_stack_csv(B_path, "*_*_process_noise_simulated.csv")
+
+print("A shape [N, 12, T]:", A_raw.shape)
+print("B shape [N, 12, T]:", B_raw.shape)
+
+A_raw = A_raw[:25]
+B_raw = B_raw[:500]
+
+N_A, D, T = A_raw.shape   # D=12, T=100
+state_dim   = 9            # dims 0-8  : time + 8 states
+control_dim = 3            # dims 9-11 : controls
+
+# Split features
+A_states   = A_raw[:, :state_dim, :]    # [N_A, 9, T]
+A_controls = A_raw[:, state_dim:, :]    # [N_A, 3, T]
+B_states   = B_raw[:, :state_dim, :]
+B_controls = B_raw[:, state_dim:, :]
+
+# ---------------------------
+# Normalize  (per-feature, over N and T)
+# ---------------------------
+# States
+A_state_mean = A_states.mean(dim=(0, 2), keepdim=True)          # [1, 9, 1]
+A_state_std  = A_states.std(dim=(0, 2),  keepdim=True) + 1e-6
+B_state_mean = B_states.mean(dim=(0, 2), keepdim=True)
+B_state_std  = B_states.std(dim=(0, 2),  keepdim=True) + 1e-6
+
+# Controls
+A_ctrl_mean  = A_controls.mean(dim=(0, 2), keepdim=True)        # [1, 3, 1]
+A_ctrl_std   = A_controls.std(dim=(0, 2),  keepdim=True) + 1e-6
+B_ctrl_mean  = B_controls.mean(dim=(0, 2), keepdim=True)
+B_ctrl_std   = B_controls.std(dim=(0, 2),  keepdim=True) + 1e-6
+
+A_states_n   = (A_states   - A_state_mean) / A_state_std
+A_controls_n = (A_controls - A_ctrl_mean)  / A_ctrl_std
+B_states_n   = (B_states   - B_state_mean) / B_state_std
+B_controls_n = (B_controls - B_ctrl_mean)  / B_ctrl_std
+
+# ---------------------------
+# Dataset
+# ---------------------------
+class TrajectoryDataset(Dataset):
+    def __init__(self, states, controls, label):
+        self.states   = states    # [N, 9, T]
+        self.controls = controls  # [N, 3, T]
+        self.label    = label
+
+    def __len__(self):
+        return self.states.size(0)
+
+    def __getitem__(self, idx):
+        return self.states[idx], self.controls[idx], self.label
+
+dataset_A = TrajectoryDataset(A_states_n, A_controls_n, label=0)
+dataset_B = TrajectoryDataset(B_states_n, B_controls_n, label=1)
+
+# ---------------------------
+# ---------------------------
+class Encoder(nn.Module):
+    def __init__(self, in_dim, z_dim, hidden_dim):
+        super().__init__()
+        self.step_proj = nn.Linear(state_dim + control_dim, in_dim)
+        self.fc1      = nn.Linear(in_dim, hidden_dim)
+        self.ln1      = nn.LayerNorm(hidden_dim)
+        self.fc2      = nn.Linear(hidden_dim, hidden_dim)
+        self.ln2      = nn.LayerNorm(hidden_dim)
+        self.fc_mu    = nn.Linear(hidden_dim, z_dim)
+        self.fc_logvar= nn.Linear(hidden_dim, z_dim)
+
+    def forward(self, s, u):
+        B, _, Tlen = s.shape
+        su = torch.cat([s, u], dim=1).permute(0, 2, 1)        # [B, T, 12]
+        su = su.reshape(B * Tlen, state_dim + control_dim)
+
+        h  = self.step_proj(su)                                # [B*T, in_dim]
+        h  = h.reshape(B, Tlen, -1).mean(dim=1)               
+        h  = F.relu(self.ln1(self.fc1(h)))
+        h  = F.relu(self.ln2(self.fc2(h)))
+        return self.fc_mu(h), self.fc_logvar(h)
+
+
+# --------------------------
+# ---------------------------
+class Decoder(nn.Module):
+    def __init__(self, z_dim, hidden_dim):
+        super().__init__()
+        in_dim = z_dim + state_dim + control_dim
+
+        # Original decoder body — unchanged
+        self.fc1   = nn.Linear(in_dim, hidden_dim)
+        self.ln1   = nn.LayerNorm(hidden_dim)
+        self.fc2   = nn.Linear(hidden_dim, hidden_dim)
+        self.ln2   = nn.LayerNorm(hidden_dim)
+        self.fc_out= nn.Linear(hidden_dim, state_dim)   # predict next state only
+
+    def forward(self, z, s_t, u_t):
+        h = F.relu(self.ln1(self.fc1(torch.cat([z, s_t, u_t], dim=1))))
+        h = F.relu(self.ln2(self.fc2(h)))
+        return self.fc_out(h)
+
+
+# ---------------------------
+# Model + optimizer
+# ---------------------------
+input_dim  = D                
+z1_dim     = 32
+z2_dim     = 32
+hidden_dim = 324
+
+encoder1 = Encoder(input_dim, z1_dim, hidden_dim).to(device)
+encoder2 = Encoder(input_dim, z2_dim, hidden_dim).to(device)
+decoderA = Decoder(z1_dim + z2_dim, hidden_dim).to(device)
+decoderB = Decoder(z1_dim + z2_dim, hidden_dim).to(device)
+
+mu1_A    = torch.zeros(z1_dim, device=device)
+logvar1_A= torch.zeros(z1_dim, device=device)
+mu1_B    = torch.ones(z1_dim,  device=device)
+logvar1_B= torch.log(torch.ones(z1_dim, device=device) * 2.0)
+
+params = (list(encoder1.parameters()) + list(encoder2.parameters()) +
+          list(decoderA.parameters()) + list(decoderB.parameters()))
+optimizer = optim.Adam(params, lr=1e-3)
+
+lambda1, lambda2 = 1.0, 1.0
+beta             = 20.0
+mi_warmup_epochs = 50
+
+# ---------------------------
+def reparam(mu, logvar):
+    std = torch.exp(0.5 * logvar)
+    return mu + std * torch.randn_like(std)
+
+def kl_diag(mu_q, logvar_q, mu_p, logvar_p):
+    var_q = torch.exp(logvar_q)
+    var_p = torch.exp(logvar_p)
+    kl = 0.5 * (torch.log(var_p) - torch.log(var_q) +
+                (var_q + (mu_q - mu_p) ** 2) / var_p - 1)
+    return kl.sum(dim=1)
+
+ema_decay = 0.99
+ema_mean  = None
+ema_cov   = None
+
+def update_ema(new_mean, new_cov):
+    global ema_mean, ema_cov
+    if ema_mean is None:
+        ema_mean = new_mean
+        ema_cov  = new_cov
+    else:
+        ema_mean = ema_decay * ema_mean + (1 - ema_decay) * new_mean
+        ema_cov  = ema_decay * ema_cov  + (1 - ema_decay) * new_cov
+
+def mi_loss_z1(z1_A, z1_B):
+    batch = torch.cat([z1_A, z1_B], dim=1)
+    mean  = batch.mean(dim=0)
+    cov   = torch.cov(batch.T)
+    update_ema(mean.detach(), cov.detach())
+
+    if ema_cov is None:
+        return torch.tensor(0.0, device=z1_A.device)
+
+    z_dim      = z1_A.size(1)
+    cov_joint  = ema_cov + 1e-6 * torch.eye(2 * z_dim, device=z1_A.device)
+    cov_A_     = cov_joint[:z_dim, :z_dim]
+    cov_B_     = cov_joint[z_dim:, z_dim:]
+
+    _, logdet_joint = torch.slogdet(cov_joint)
+    _, logdet_A_    = torch.slogdet(cov_A_)
+    _, logdet_B_    = torch.slogdet(cov_B_)
+    return 0.5 * (logdet_A_ + logdet_B_ - logdet_joint)
+
+# --------------------------
+# ---------------------------
+def stepwise_recon_loss(decoder, z, s_traj, u_traj):
+    loss = 0.0
+    for t in range(T - 1):
+        s_t      = s_traj[:, :, t]          # [B, 9]
+        u_t      = u_traj[:, :, t]          # [B, 3]
+        s_t1_gt  = s_traj[:, :, t + 1]     # [B, 9]
+        s_t1_hat = decoder(z, s_t, u_t)    # [B, 9]
+        loss     = loss + F.mse_loss(s_t1_hat, s_t1_gt, reduction='sum')
+    return loss 
+
+epochs     = 100
+batch_size = 32
+
+A_states_dev   = A_states_n.to(device)    # [N_A, 9, T]
+A_controls_dev = A_controls_n.to(device)
+B_states_dev   = B_states_n.to(device)
+B_controls_dev = B_controls_n.to(device)
+
+loss_history = []
+mi_history   = []
+
+for epoch in range(epochs):
+    max_len    = max(len(A_states_dev), len(B_states_dev))
+    num_batches= max_len // batch_size
+    def tile(x, target):
+        reps = (target // len(x)) + 1
+        return x.repeat(reps, *([1] * (x.dim() - 1)))[:target]
+
+    sA = tile(A_states_dev,   max_len)
+    uA = tile(A_controls_dev, max_len)
+    sB = tile(B_states_dev,   max_len)
+    uB = tile(B_controls_dev, max_len)
+
+    # Shuffle
+    sA = sA[torch.randperm(max_len)]
+    uA = uA[torch.randperm(max_len)]
+    sB = sB[torch.randperm(max_len)]
+    uB = uB[torch.randperm(max_len)]
+
+    tot_loss = tot_mi = tot_kl1 = tot_kl2 = 0.0
+
+    for b in range(num_batches):
+        sl = slice(b * batch_size, (b + 1) * batch_size)
+        sA_b = sA[sl];  uA_b = uA[sl]    # [B, 9, T] / [B, 3, T]
+        sB_b = sB[sl];  uB_b = uB[sl]
+
+        mu1_A_enc, logvar1_A_enc = encoder1(sA_b, uA_b)
+        z1_A_batch = reparam(mu1_A_enc, logvar1_A_enc)
+
+        mu1_B_enc, logvar1_B_enc = encoder1(sB_b, uB_b)
+        z1_B_batch = reparam(mu1_B_enc, logvar1_B_enc)
+        mu2_enc, logvar2_enc = encoder2(
+            torch.cat([sA_b, sB_b], dim=0),
+            torch.cat([uA_b, uB_b], dim=0)
+        )
+        z_shared   = reparam(mu2_enc, logvar2_enc)
+        z2_A_batch = z_shared[:batch_size]
+        z2_B_batch = z_shared[batch_size:]
+
+    
+        zA_full = torch.cat([z1_A_batch, z2_A_batch], dim=1)  # [B, 64]
+        zB_full = torch.cat([z1_B_batch, z2_B_batch], dim=1)
+
+        rec_loss = (stepwise_recon_loss(decoderA, zA_full, sA_b, uA_b) +
+                    stepwise_recon_loss(decoderB, zB_full, sB_b, uB_b))
+
+        
+        kl1_A = kl_diag(mu1_A_enc, logvar1_A_enc, mu1_A, logvar1_A).sum()
+        kl1_B = kl_diag(mu1_B_enc, logvar1_B_enc, mu1_B, logvar1_B).sum()
+        kl1   = kl1_A + kl1_B
+        kl2   = kl_diag(mu2_enc, logvar2_enc,
+                         torch.zeros_like(mu2_enc),
+                         torch.zeros_like(logvar2_enc)).sum()
+
+       
+        mi_z1 = mi_loss_z1(z1_A_batch, z1_B_batch)
+
+    
+        if epoch >= mi_warmup_epochs:
+            loss = rec_loss + lambda1 * kl1 + lambda2 * kl2 + beta * mi_z1
+        else:
+            loss = rec_loss + lambda1 * kl1 + lambda2 * kl2
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        tot_loss += loss.item()
+        tot_mi   += mi_z1.item()
+        tot_kl1  += kl1.item()
+        tot_kl2  += kl2.item()
+
+    loss_history.append(tot_loss / max_len)
+    mi_history.append(tot_mi / num_batches)
+
+    print(f"Epoch {epoch+1}/{epochs} | "
+          f"Loss: {tot_loss/max_len:.4f} | "
+          f"KL1: {tot_kl1/max_len:.4f} | KL2: {tot_kl2/max_len:.4f} | "
+          f"MI: {tot_mi/num_batches:.4f}")
+
+
+plt.figure(figsize=(10, 4))
+plt.subplot(1, 2, 1); plt.plot(loss_history); plt.title("Total Loss");  plt.grid(True)
+plt.subplot(1, 2, 2); plt.plot(mi_history);   plt.title("MI(z1_A,z1_B)"); plt.grid(True)
+plt.tight_layout(); plt.show()
+
+# ---------------------------
+
+# ---------------------------
+def rollout(s0, u_seq, decoder, z,
+            state_mean, state_std, ctrl_mean, ctrl_std):
+
+    decoder.eval()
+    with torch.no_grad():
+        B = s0.shape[0]
+        s_n = (s0.to(device) - state_mean.squeeze(-1).to(device)) \
+               / state_std.squeeze(-1).to(device)
+        u_n = (u_seq.to(device) - ctrl_mean.to(device)) / ctrl_std.to(device)
+
+        traj = [s_n]
+        s_t  = s_n
+        for t in range(u_seq.shape[-1]):
+            u_t = u_n[:, :, t]
+            s_t = decoder(z, s_t, u_t)
+            traj.append(s_t)
+
+        traj = torch.stack(traj, dim=2)        # [B, 9, T]
+        return traj * state_std.to(device) + state_mean.to(device)
+# ---------------------------
+
+# ---------------------------
+torch.save({
+    "decoderA_state_dict": decoderA.state_dict(),
+    "decoderB_state_dict": decoderB.state_dict(),
+    "encoder1_state_dict": encoder1.state_dict(),
+    "encoder2_state_dict": encoder2.state_dict(),
+    "A_state_mean": A_state_mean.cpu(),
+    "A_state_std":  A_state_std.cpu(),
+    "A_ctrl_mean":  A_ctrl_mean.cpu(),
+    "A_ctrl_std":   A_ctrl_std.cpu(),
+    "B_state_mean": B_state_mean.cpu(),
+    "B_state_std":  B_state_std.cpu(),
+    "B_ctrl_mean":  B_ctrl_mean.cpu(),
+    "B_ctrl_std":   B_ctrl_std.cpu(),
+    "state_dim":   state_dim,
+    "control_dim": control_dim,
+    "z1_dim":      z1_dim,
+    "z2_dim":      z2_dim,
+    "hidden_dim":  hidden_dim,
+    "T":           T,
+}, "stepwise_mivae.pth")
+print("Saved stepwise_mivae.pth")
