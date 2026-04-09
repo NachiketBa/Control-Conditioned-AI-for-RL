@@ -1,4 +1,4 @@
-# Trajectory Prediction with RNN informed CVAE and MI-VAE
+# Trajectory Prediction with RNN informed CVAE and MI-CVAE
 
 Two trained models, two testing scripts, one goal: roll out plausible state trajectories from a learned latent space conditioned on state and control input.
 
@@ -9,7 +9,7 @@ Two trained models, two testing scripts, one goal: roll out plausible state traj
 | File | Description |
 |---|---|
 | `CVRNN_teacher_forced.py` | Trains the RNN informed CVAE on real data |
-| `MIVRNN_teacher_forced.py` | Trains the RNN informed MIVAE with shared/unique latent structure |
+| `MIVRNN_teacher_forced.py` | Trains the RNN informed MI-CVAE with shared/unique latent structure |
 | `CVRNN_teacher_forced_test.py` | Loads decoder and rolls out trajectory samples |
 | `MIVRNN_teacher_forced_test.py` | Loads decoder specific to real data and rolls out trajectory samples |
 
@@ -26,7 +26,7 @@ A conditional variational autoencoder trained to predict next states step by ste
 - KL annealing over first 300 epochs, max weight 0.05
 - Trained on N real-noise trajectories
 
-## RNN informed MI-VAE (`stepwise_mivae.pth`)
+## RNN informed MI-CVAE (`stepwise_mivae.pth`)
 
 A two-encoder CVAE trained on real (`A`) and simulated (`B`) trajectories simultaneously. The setup splits the latent space into two parts:
 
@@ -55,6 +55,6 @@ The spread of sampled trajectories reflects model uncertainty. Tight clustering 
 
 ## Notes
 
-- The MI-VAE test only uses `decoderA` (real noise decoder).
+- The MI-CVAE test only uses `decoderA` (real noise decoder).
 - Normalization stats are saved in the checkpoint, so no need to recompute them at test time.
 - Both decoders are autoregressive: prediction errors accumulate over long horizons. Short rollouts will be tighter than long ones.
