@@ -26,7 +26,7 @@ A conditional variational autoencoder trained to predict next states step by ste
 - KL annealing over first 300 epochs, max weight 0.05
 - Trained on N real-noise trajectories
 
-###RNN informed MI-VAE (`stepwise_mivae.pth`)
+## RNN informed MI-VAE (`stepwise_mivae.pth`)
 
 A two-encoder CVAE trained on real (`A`) and simulated (`B`) trajectories simultaneously. The setup splits the latent space into two parts:
 
